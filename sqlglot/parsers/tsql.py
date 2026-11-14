@@ -249,6 +249,50 @@ def _build_datetimefromparts(args: list) -> exp.TimestampFromParts:
     )
 
 
+# https://learn.microsoft.com/en-us/sql/t-sql/functions/datetime2fromparts-transact-sql
+def _build_datetime2fromparts(args: list) -> exp.TimestampFromParts:
+    # The 8th argument is the fractional-seconds precision of the 7th (fractions) argument; it is
+    # not a value itself and gets dropped when the fractions are converted to nanoseconds. The
+    # raw arguments are kept as metadata so a T-SQL round-trip reproduces them unchanged.
+    fractions = seq_get(args, 6)
+    precision = seq_get(args, 7)
+    nano = (
+        fractions
+        * exp.func("POW", exp.Literal.number(10), exp.Literal.number(9) - precision)
+        if fractions is not None and precision is not None
+        else fractions
+    )
+    expression = exp.TimestampFromParts(
+        year=seq_get(args, 0),
+        month=seq_get(args, 1),
+        day=seq_get(args, 2),
+        hour=seq_get(args, 3),
+        min=seq_get(args, 4),
+        sec=seq_get(args, 5),
+        nano=nano,
+    )
+    expression.meta["tsql_datetime_kind"] = "DATETIME2FROMPARTS"
+    if fractions is not None:
+        expression.meta["tsql_datetime2_fractions"] = fractions
+    if precision is not None:
+        expression.meta["tsql_datetime2_precision"] = precision
+    return expression
+
+
+# https://learn.microsoft.com/en-us/sql/t-sql/functions/smalldatetimefromparts-transact-sql
+def _build_smalldatetimefromparts(args: list) -> exp.TimestampFromParts:
+    expression = exp.TimestampFromParts(
+        year=seq_get(args, 0),
+        month=seq_get(args, 1),
+        day=seq_get(args, 2),
+        hour=seq_get(args, 3),
+        min=seq_get(args, 4),
+        sec=exp.Literal.number(0),
+    )
+    expression.meta["tsql_datetime_kind"] = "SMALLDATETIMEFROMPARTS"
+    return expression
+
+
 # https://learn.microsoft.com/en-us/sql/t-sql/functions/timefromparts-transact-sql?view=sql-server-ver16#syntax
 def _build_timefromparts(args: list) -> exp.TimeFromParts:
     return exp.TimeFromParts(
@@ -384,6 +428,8 @@ class TSQLParser(parser.Parser):
         ),
         "DATENAME": _build_formatted_time(exp.TimeToStr, full_format_mapping=True),
         "DATETIMEFROMPARTS": _build_datetimefromparts,
+        "DATETIME2FROMPARTS": _build_datetime2fromparts,
+        "SMALLDATETIMEFROMPARTS": _build_smalldatetimefromparts,
         "DAY": lambda args: exp.Day(
             this=exp.TsOrDsToDate(
                 this=seq_get(args, 0), default_date=exp.Literal.string("1900-01-01")

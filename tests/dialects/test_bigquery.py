@@ -4559,3 +4559,18 @@ OPTIONS (
                         "duckdb": "SELECT CAST(1 AS DECIMAL(38, 5))",
                     },
                 )
+
+    def test_component_timestamp_constructor(self):
+        # The component-based TIMESTAMP(year, month, day, hour, minute, second[, ...]) form must
+        # parse instead of being rejected for exceeding the 2-arg TIMESTAMP(expr[, zone]) limit.
+        self.validate_all(
+            "SELECT TIMESTAMP(2020, 1, 2, 3, 4, 5)",
+            write={
+                "bigquery": "SELECT DATETIME(2020, 1, 2, 3, 4, 5)",
+                "postgres": "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 5)",
+                "duckdb": "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 5)",
+            },
+        )
+        # The one/two-argument expression form keeps its TIMESTAMP identity
+        self.validate_identity("SELECT TIMESTAMP('2020-01-01')")
+        self.validate_identity("SELECT TIMESTAMP('2020-01-01', 'UTC')")

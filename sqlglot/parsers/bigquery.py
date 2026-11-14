@@ -154,7 +154,13 @@ def _build_time(args: list) -> exp.Func:
     return exp.TimeFromParts.from_arg_list(args)
 
 
-def _build_timestamp(args: list) -> exp.Timestamp:
+def _build_timestamp(args: list) -> exp.Func:
+    # TIMESTAMP(timestamp_expression[, timezone]) accepts at most two arguments, whereas the
+    # component-based construction TIMESTAMP(year, month, day, hour, minute, second[, ...]) is
+    # represented like DATETIME(...) above, i.e. as a TimestampFromParts with timezone support.
+    if len(args) > 2:
+        return exp.TimestampFromParts.from_arg_list(args)
+
     timestamp = exp.Timestamp.from_arg_list(args)
     timestamp.set("with_tz", True)
     return timestamp

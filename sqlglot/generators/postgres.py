@@ -64,6 +64,13 @@ DATE_DIFF_BOUNDARY_UNITS = {
     "YEAR",
 }
 
+# Characters that are special in PostgreSQL POSIX regular expressions. A literal delimiter has to
+# be neutralized before it can be fed to REGEXP_SPLIT_TO_ARRAY / REGEXP_SPLIT_TO_TABLE, otherwise
+# literal split semantics (e.g. Presto's SPLIT, BigQuery's SPLIT) would silently turn into regex
+# semantics (e.g. '.' splitting on every character).
+# https://www.postgresql.org/docs/current/functions-matching.html#POSIX-SYNTAX-DETAILS
+_REGEX_METACHARACTERS = set("\\" + ".^$*+?()[]{}|")
+
 
 def _date_add_sql(kind: str) -> t.Callable[[PostgresGenerator, DATE_ADD_OR_SUB], str]:
     def func(self: PostgresGenerator, expression: DATE_ADD_OR_SUB) -> str:
@@ -272,6 +279,174 @@ def _round_sql(self: PostgresGenerator, expression: exp.Round) -> str:
     return self.func("ROUND", this, decimals)
 
 
+def _escape_regex_literal(self: PostgresGenerator, delimiter: exp.Expr) -> exp.Expr:
+    """Build a regex pattern that matches ``delimiter`` literally, preserving source split semantics.
+
+    String literals are escaped at transpile time; any other expression (e.g. a column or a
+    function call) is escaped at runtime with nested REPLACE calls, because its value is not known
+    here. The backslash is replaced first so it cannot re-escape the backslashes added later.
+    """
+    if delimiter.is_string:
+        escaped = "".join(
+            ("\\" + ch) if ch in _REGEX_METACHARACTERS else ch for ch in delimiter.this
+        )
+        return exp.Literal.string(escaped)
+
+    escaped = delimiter
+    for ch in ["\\", *sorted(_REGEX_METACHARACTERS - {"\\"})]:
+        escaped = exp.func(
+            "REPLACE",
+            escaped,
+            exp.Literal.string(ch),
+            exp.Literal.string("\\" + ch),
+        )
+    return escaped
+
+
+def _split_sql(self: PostgresGenerator, expression: exp.Split) -> str:
+    # PostgreSQL has no SPLIT function. STRING_TO_ARRAY performs a literal (string) split, which
+    # matches the semantics of Presto/Trino/BigQuery/Snowflake SPLIT and DuckDB STRING_SPLIT.
+    if expression.args.get("limit") is not None:
+        self.unsupported(
+            "The SPLIT limit argument is not supported by PostgreSQL's STRING_TO_ARRAY"
+        )
+
+    delimiter = expression.expression
+    if expression.args.get("null_returns_null") and isinstance(delimiter, exp.Null):
+        # Snowflake's SPLIT(input, NULL) returns NULL, whereas STRING_TO_ARRAY treats a NULL
+        # delimiter like an empty one, so the source behavior has to be made explicit.
+        case_expr = exp.Case()
+        case_expr = case_expr.when(exp.Null().is_(exp.null()), exp.null())
+        case_expr = case_expr.else_(exp.func("STRING_TO_ARRAY", expression.this, delimiter))
+        return self.sql(case_expr)
+
+    return self.func("STRING_TO_ARRAY", expression.this, delimiter)
+
+
+def _regexp_split_sql(self: PostgresGenerator, expression: exp.RegexpSplit) -> str:
+    # Hive/Spark SPLIT, Presto/Trino REGEXP_SPLIT, etc. treat the delimiter as a regular
+    # expression, so they map to PostgreSQL's regex split rather than STRING_TO_ARRAY.
+    if expression.args.get("limit") is not None:
+        self.unsupported(
+            "The REGEXP_SPLIT limit argument is not supported by PostgreSQL's "
+            "REGEXP_SPLIT_TO_ARRAY"
+        )
+    return self.func("REGEXP_SPLIT_TO_ARRAY", expression.this, expression.expression)
+
+
+def _split_to_table_sql(self: PostgresGenerator, expression: exp.SplitToTable) -> str:
+    return self.func(
+        "REGEXP_SPLIT_TO_TABLE",
+        expression.this,
+        _escape_regex_literal(self, expression.expression),
+    )
+
+
+def _date_from_parts_sql(self: PostgresGenerator, expression: exp.DateFromParts) -> str:
+    # PostgreSQL's MAKE_DATE(year, month, day) is the equivalent of DATE_FROM_PARTS /
+    # DATEFROMPARTS. Unlike Snowflake, it rejects out-of-range month/day values.
+    if expression.args.get("allow_overflow"):
+        base_date = exp.func(
+            "MAKE_DATE",
+            expression.args["year"],
+            exp.Literal.number(1),
+            exp.Literal.number(1),
+        )
+        if (month := expression.args.get("month")) is not None:
+            base_date = base_date + exp.Interval(
+                this=month - exp.Literal.number(1), unit=exp.var("MONTH")
+            )
+        if (day := expression.args.get("day")) is not None:
+            base_date = base_date + exp.Interval(
+                this=day - exp.Literal.number(1), unit=exp.var("DAY")
+            )
+        return self.sql(exp.cast(base_date, exp.DType.DATE))
+
+    return self.func(
+        "MAKE_DATE",
+        expression.args.get("year"),
+        expression.args.get("month"),
+        expression.args.get("day"),
+    )
+
+
+def _timestamp_from_parts_sql(
+    self: PostgresGenerator, expression: exp.TimestampFromParts
+) -> str:
+    # Snowflake's TIMESTAMP_FROM_PARTS(date_expr, time_expr) two-argument form: a date plus a
+    # time is a timestamp in PostgreSQL too.
+    if expression.this is not None and expression.expression is not None:
+        return self.sql(exp.Add(this=expression.this, expression=expression.expression))
+
+    # MAKE_TIMESTAMP takes (year, month, day, hour, minute, second[double]); sub-second
+    # information from T-SQL / Snowflake has to be folded into the seconds argument instead of
+    # being passed as extra arguments, which PostgreSQL would reject at runtime.
+    sec = expression.args.get("sec")
+    if sec is None:
+        return rename_func("MAKE_TIMESTAMP")(self, expression)
+
+    if (milli := expression.args.pop("milli", None)) is not None:
+        sec = sec + milli / exp.Literal.number(1000.0)
+    if (nano := expression.args.pop("nano", None)) is not None:
+        sec = sec + nano / exp.Literal.number(1000000000.0)
+    expression.set("sec", sec)
+
+    if (zone := expression.args.pop("zone", None)) is not None:
+        return f"{rename_func('MAKE_TIMESTAMP')(self, expression)} AT TIME ZONE {self.sql(zone)}"
+
+    return rename_func("MAKE_TIMESTAMP")(self, expression)
+
+
+def _timestamp_ltz_from_parts_sql(
+    self: PostgresGenerator, expression: exp.TimestampLtzFromParts
+) -> str:
+    if (nano := expression.args.get("nano")) is not None:
+        nano.pop()
+        self.unsupported(
+            "Nanosecond precision is not supported by PostgreSQL's MAKE_TIMESTAMP"
+        )
+    return f"CAST({rename_func('MAKE_TIMESTAMP')(self, expression)} AS TIMESTAMPTZ)"
+
+
+def _timestamp_tz_from_parts_sql(
+    self: PostgresGenerator, expression: exp.TimestampTzFromParts
+) -> str:
+    zone = expression.args.pop("zone", None)
+    if (nano := expression.args.get("nano")) is not None:
+        nano.pop()
+        self.unsupported(
+            "Nanosecond precision is not supported by PostgreSQL's MAKE_TIMESTAMP"
+        )
+
+    timestamp = rename_func("MAKE_TIMESTAMP")(self, expression)
+    if zone is not None:
+        return f"{timestamp} AT TIME ZONE {self.sql(zone)}"
+    return timestamp
+
+
+def _time_from_parts_sql(self: PostgresGenerator, expression: exp.TimeFromParts) -> str:
+    # MAKE_TIME(hour, minute, second[double]) accepts only these three arguments. T-SQL's
+    # fractions/precision and Snowflake's nanoseconds are folded into the seconds argument.
+    sec = expression.args.get("sec")
+    if sec is not None:
+        if (nano := expression.args.pop("nano", None)) is not None:
+            sec = sec + nano / exp.Literal.number(1000000000.0)
+        if (fractions := expression.args.pop("fractions", None)) is not None:
+            precision = expression.args.pop("precision", None)
+            divisor = (
+                exp.func("POW", exp.Literal.number(10), precision)
+                if precision is not None
+                else exp.Literal.number(1000000000.0)
+            )
+            sec = sec + fractions / divisor
+        expression.set("sec", sec)
+
+    if expression.args.pop("overflow", None) is not None:
+        self.unsupported("PostgreSQL's MAKE_TIME does not support out-of-range time parts")
+
+    return rename_func("MAKE_TIME")(self, expression)
+
+
 class PostgresGenerator(generator.Generator):
     SELECT_KINDS = ()
     VARIANCE_NAME = "VAR_SAMP"
@@ -363,6 +538,7 @@ class PostgresGenerator(generator.Generator):
         exp.CurrentVersion: rename_func("VERSION"),
         exp.DateAdd: _date_add_sql("+"),
         exp.DateDiff: _date_diff_sql,
+        exp.DateFromParts: _date_from_parts_sql,
         exp.DateStrToDate: datestrtodate_sql,
         exp.DateSub: _date_add_sql("-"),
         exp.DatetimeAdd: _date_add_sql("+"),
@@ -412,6 +588,7 @@ class PostgresGenerator(generator.Generator):
             e.args.get("occurrence"),
             regexp_replace_global_modifier(e),
         ),
+        exp.RegexpSplit: _regexp_split_sql,
         exp.Round: _round_sql,
         exp.Select: transforms.preprocess(
             [
@@ -428,8 +605,12 @@ class PostgresGenerator(generator.Generator):
         exp.StrToTime: lambda self, e: self.func("TO_TIMESTAMP", e.this, self.format_time(e)),
         exp.StructExtract: struct_extract_sql,
         exp.Substring: _substring_sql,
-        exp.TimeFromParts: rename_func("MAKE_TIME"),
-        exp.TimestampFromParts: rename_func("MAKE_TIMESTAMP"),
+        exp.Split: _split_sql,
+        exp.SplitToTable: _split_to_table_sql,
+        exp.TimeFromParts: _time_from_parts_sql,
+        exp.TimestampFromParts: _timestamp_from_parts_sql,
+        exp.TimestampLtzFromParts: _timestamp_ltz_from_parts_sql,
+        exp.TimestampTzFromParts: _timestamp_tz_from_parts_sql,
         exp.TimestampTrunc: timestamptrunc_sql(zone=True),
         exp.TimestampAdd: _date_add_sql("+"),
         exp.TimestampSub: _date_add_sql("-"),

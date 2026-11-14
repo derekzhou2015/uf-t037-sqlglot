@@ -2774,3 +2774,133 @@ CROSS JOIN JSON_ARRAY_ELEMENTS(CAST(JSON_EXTRACT_PATH(tbox, 'boxes') AS JSON)) A
             simplify(expression, dialect="postgres").sql("postgres"),
             "SELECT t.i + CAST('2024-01-02' AS TIMESTAMP) FROM t AS t",
         )
+
+    def test_split_family(self):
+        # Regex-delimiter dialects (Hive/Spark SPLIT, Presto/Trino REGEXP_SPLIT) map to Postgres'
+        # regex split, while literal-delimiter dialects map to STRING_TO_ARRAY. No dialect may
+        # produce the non-existent SPLIT / REGEXP_SPLIT function names when targeting Postgres.
+        self.validate_all(
+            "SELECT REGEXP_SPLIT_TO_ARRAY(a, ';')",
+            read={
+                "hive": "SELECT SPLIT(a, ';')",
+                "spark": "SELECT SPLIT(a, ';')",
+                "spark2": "SELECT SPLIT(a, ';')",
+                "presto": "SELECT REGEXP_SPLIT(a, ';')",
+                "trino": "SELECT REGEXP_SPLIT(a, ';')",
+                "clickhouse": "SELECT splitByRegexp(';', a)",
+                "duckdb": "SELECT STR_SPLIT_REGEX(a, ';')",
+            },
+        )
+        self.validate_all(
+            "SELECT STRING_TO_ARRAY(a, 'a.b')",
+            read={
+                "presto": "SELECT SPLIT(a, 'a.b')",
+                "trino": "SELECT SPLIT(a, 'a.b')",
+                "bigquery": "SELECT SPLIT(a, 'a.b')",
+                "snowflake": "SELECT SPLIT(a, 'a.b')",
+                "clickhouse": "SELECT splitByString('a.b', a)",
+                "duckdb": "SELECT STR_SPLIT(a, 'a.b')",
+                "redshift": "SELECT SPLIT_TO_ARRAY(a, 'a.b')",
+            },
+        )
+        # A non-literal delimiter keeps the source's literal (STRING_TO_ARRAY) semantics
+        self.validate_all(
+            "SELECT STRING_TO_ARRAY(a, b)",
+            read={"presto": "SELECT SPLIT(a, b)"},
+        )
+        # Snowflake's SPLIT(input, NULL) returns NULL, unlike STRING_TO_ARRAY's NULL delimiter
+        self.validate_all(
+            "SELECT CASE WHEN NULL IS NULL THEN NULL ELSE STRING_TO_ARRAY(a, NULL) END",
+            read={"snowflake": "SELECT SPLIT(a, NULL)"},
+        )
+        # SPLIT_TO_TABLE is a UDTF and maps to the regex table variant, escaping the literal
+        self.validate_all(
+            "SELECT t.value FROM TABLE(REGEXP_SPLIT_TO_TABLE('a,b,c', ',')) AS t",
+            read={
+                "snowflake": "SELECT t.value FROM TABLE(SPLIT_TO_TABLE('a,b,c', ',')) AS t",
+            },
+        )
+        # The SPLIT limit argument has no Postgres equivalent and must be reported, not emitted
+        expression = parse_one("SELECT splitByString(',', 'a,b,c', 2)", read="clickhouse")
+        with self.assertLogs(generator_logger, level="WARNING"):
+            self.assertEqual(
+                expression.sql("postgres"),
+                "SELECT STRING_TO_ARRAY('a,b,c', ',')",
+            )
+        with self.assertRaises(UnsupportedError):
+            expression.sql("postgres", unsupported_level=ErrorLevel.IMMEDIATE)
+
+        expression = parse_one("SELECT REGEXP_SPLIT(a, ',', 3)", read="presto")
+        with self.assertRaises(UnsupportedError):
+            expression.sql("postgres", unsupported_level=ErrorLevel.IMMEDIATE)
+
+    def test_datetime_constructor_family(self):
+        # DATE_FROM_PARTS / DATEFROMPARTS -> MAKE_DATE(year, month, day)
+        self.validate_all(
+            "SELECT MAKE_DATE(2020, 1, 2)",
+            read={
+                "tsql": "SELECT DATEFROMPARTS(2020, 1, 2)",
+                "bigquery": "SELECT DATE(2020, 1, 2)",
+                "duckdb": "SELECT MAKE_DATE(2020, 1, 2)",
+            },
+        )
+        # Snowflake allows out-of-range parts; the overflow arithmetic preserves that semantics
+        self.validate_all(
+            "SELECT CAST(MAKE_DATE(2020, 1, 1) + INTERVAL '1 MONTH' + INTERVAL '2 DAY' AS DATE)",
+            read={"snowflake": "SELECT DATE_FROM_PARTS(2020, 1, 2)"},
+        )
+        # DATETIMEFROMPARTS: milliseconds are folded into the seconds argument instead of being
+        # passed as a 7th argument, which Postgres' MAKE_TIMESTAMP would reject at runtime.
+        self.validate_all(
+            "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 5 + (CAST(6 AS DOUBLE PRECISION) / 1000.0))",
+            read={"tsql": "SELECT DATETIMEFROMPARTS(2020, 1, 2, 3, 4, 5, 6)"},
+        )
+        # DATETIME2FROMPARTS: fractions + precision become nanoseconds folded into seconds
+        self.validate_all(
+            "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 5 + (CAST((6 * (POWER(10, 9 - 3))) AS DOUBLE PRECISION) / 1000000000.0))",
+            read={"tsql": "SELECT DATETIME2FROMPARTS(2020, 1, 2, 3, 4, 5, 6, 3)"},
+        )
+        # SMALLDATETIMEFROMPARTS has no seconds component
+        self.validate_all(
+            "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 0)",
+            read={"tsql": "SELECT SMALLDATETIMEFROMPARTS(2020, 1, 2, 3, 4)"},
+        )
+        # BigQuery's component-based TIMESTAMP(...) / DATETIME(...) no longer fail to parse
+        self.validate_all(
+            "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 5)",
+            read={
+                "bigquery": "SELECT TIMESTAMP(2020, 1, 2, 3, 4, 5)",
+            },
+        )
+        # Nanoseconds are folded into seconds
+        self.validate_all(
+            "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 5 + (CAST(987654321 AS DOUBLE PRECISION) / 1000000000.0))",
+            read={"snowflake": "SELECT TIMESTAMP_FROM_PARTS(2020, 1, 2, 3, 4, 5, 987654321)"},
+        )
+        # Timezone-aware variants
+        self.validate_all(
+            "SELECT CAST(MAKE_TIMESTAMP(2023, 6, 15, 14, 30, 45) AS TIMESTAMPTZ)",
+            read={"snowflake": "SELECT TIMESTAMP_LTZ_FROM_PARTS(2023, 6, 15, 14, 30, 45)"},
+        )
+        self.validate_all(
+            "SELECT MAKE_TIMESTAMP(2023, 6, 15, 14, 30, 45) AT TIME ZONE 'America/Los_Angeles'",
+            read={
+                "snowflake": "SELECT TIMESTAMP_TZ_FROM_PARTS(2023, 6, 15, 14, 30, 45, 0, 'America/Los_Angeles')",
+            },
+        )
+        # Snowflake's two-argument (date + time) form
+        self.validate_all(
+            "SELECT CAST('2023-06-15' AS DATE) + CAST('14:30:45' AS TIME)",
+            read={
+                "snowflake": "SELECT TIMESTAMP_FROM_PARTS(TO_DATE('2023-06-15'), TO_TIME('14:30:45'))",
+            },
+        )
+        # TIMEFROMPARTS: T-SQL fractions/precision and Snowflake nanoseconds fold into seconds
+        self.validate_all(
+            "SELECT MAKE_TIME(23, 59, 59 + (CAST(1234567 AS DOUBLE PRECISION) / (POWER(10, 7))))",
+            read={"tsql": "SELECT TIMEFROMPARTS(23, 59, 59, 1234567, 7)"},
+        )
+        self.validate_all(
+            "SELECT MAKE_TIME(23, 59, 59 + (CAST(987654321 AS DOUBLE PRECISION) / 1000000000.0))",
+            read={"snowflake": "SELECT TIME_FROM_PARTS(23, 59, 59, 987654321)"},
+        )

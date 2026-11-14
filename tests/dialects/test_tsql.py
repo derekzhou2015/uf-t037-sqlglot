@@ -3272,3 +3272,23 @@ FROM OPENJSON(@json) WITH (
             "IF ((@x = @y AND GETDATE() = GETDATE()) OR (GETDATE() = @t)) BEGIN SET @query_result = (SELECT MAX(id) + 1 FROM t); END",
             "IF (@x = @y AND GETDATE() = GETDATE()) OR (GETDATE() = @t) BEGIN SET @query_result = (SELECT MAX(id) + 1 FROM t); END",
         )
+
+    def test_datetime_constructor_parts(self):
+        # The DATETIME2/SMALLDATETIME constructors parse into typed expressions and round-trip
+        # with their original function names instead of falling through as anonymous functions.
+        self.validate_identity("SELECT DATETIME2FROMPARTS(2020, 1, 2, 3, 4, 5, 6, 3)")
+        self.validate_identity("SELECT SMALLDATETIMEFROMPARTS(2020, 1, 2, 3, 4)")
+        self.validate_identity("SELECT DATETIMEFROMPARTS(2013, 4, 5, 12, 0, 0, 0)")
+
+        # When targeting Postgres the constructors become MAKE_TIMESTAMP with sub-second parts
+        # folded into the seconds argument instead of passing an unsupported argument count.
+        self.validate_all(
+            "SELECT DATETIME2FROMPARTS(2020, 1, 2, 3, 4, 5, 6, 3)",
+            write={
+                "postgres": "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 5 + (CAST((6 * (POWER(10, 9 - 3))) AS DOUBLE PRECISION) / 1000000000.0))",
+            },
+        )
+        self.validate_all(
+            "SELECT SMALLDATETIMEFROMPARTS(2020, 1, 2, 3, 4)",
+            write={"postgres": "SELECT MAKE_TIMESTAMP(2020, 1, 2, 3, 4, 0)"},
+        )

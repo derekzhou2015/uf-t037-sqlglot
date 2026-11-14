@@ -448,6 +448,37 @@ class TSQLGenerator(generator.Generator):
             zone.pop()
             self.unsupported("Time zone is not supported in DATETIMEFROMPARTS.")
 
+        kind = expression.meta.get("tsql_datetime_kind")
+        if kind == "DATETIME2FROMPARTS":
+            # The raw fractions/precision were retained as metadata during parsing, so a T-SQL
+            # round-trip reproduces the original call instead of reconstructing it from nanoseconds.
+            fractions = expression.meta.get("tsql_datetime2_fractions")
+            precision = expression.meta.get("tsql_datetime2_precision")
+            if fractions is None or precision is None:
+                fractions = fractions or exp.Literal.number(0)
+                precision = precision or exp.Literal.number(7)
+            return self.func(
+                "DATETIME2FROMPARTS",
+                expression.args.get("year"),
+                expression.args.get("month"),
+                expression.args.get("day"),
+                expression.args.get("hour"),
+                expression.args.get("min"),
+                expression.args.get("sec"),
+                fractions,
+                precision,
+            )
+
+        if kind == "SMALLDATETIMEFROMPARTS":
+            return self.func(
+                "SMALLDATETIMEFROMPARTS",
+                expression.args.get("year"),
+                expression.args.get("month"),
+                expression.args.get("day"),
+                expression.args.get("hour"),
+                expression.args.get("min"),
+            )
+
         nano = expression.args.get("nano")
         if nano is not None:
             nano.pop()
